@@ -5,7 +5,7 @@ This repository contains the implementation of RouteSAE.
 You can download the required dataset and models from the following links:
 
 - [OpenWebText2 Dataset](https://huggingface.co/datasets/segyges/OpenWebText2)
-- [Llama-3.2-1B Model](https://huggingface.co/meta-llama/Llama-3.2-1B)
+- [Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
 
 
 The code is written in Python 3.12. The required packages are listed in `requirements.txt`. You can install them by running the following command:
