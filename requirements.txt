@@ -1,0 +1,7 @@
+numpy==2.2.3
+openai==1.63.0
+PyYAML==6.0.2
+tiktoken==0.7.0
+torch==2.4.0
+transformers==4.46.1
+wandb==0.19.6
