@@ -33,7 +33,7 @@ class Vanilla(nn.Module):
     ) -> torch.Tensor:
         assert not (infer_k is not None and theta is not None), 'infer_k and theta cannot both be provided.'
         if theta is not None:
-            latents = torch.where(pre_acts>theta, pre_acts, torch.zeros_like(x))
+            latents = torch.where(pre_acts>theta, pre_acts, torch.zeros_like(pre_acts))
         elif infer_k is not None:
             topk = torch.topk(pre_acts, infer_k, dim=-1)
             latents = torch.zeros_like(pre_acts)

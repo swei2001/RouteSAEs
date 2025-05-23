@@ -20,7 +20,7 @@ from openai import AzureOpenAI
 from collections import defaultdict
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.hooks import RemovableHandle
-from torch.utils.data import Dataset, IterableDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 
@@ -51,7 +51,6 @@ def parse_args():
     parser.add_argument('--n_layers', type=int, required=False, help='Number of layers in the language model')
     parser.add_argument('--aggre', type=str, required=False, help='Aggregation strategy for Router input (e.g., "sum", "mean")')
     parser.add_argument('--routing', type=str, required=False, help='Routing strategy for RouteSAE (e.g., "hard", "soft")')
-    parser.add_argument('--alpha', type=float, required=False, help='coefficient alpha for aux loss (e.g., "0.0001")')
 
     parser.add_argument('--SAE_path', type=str, required=False, help='Path to the trained SAE model file')
     parser.add_argument('--metric', type=str, required=False, help='Evaluation metric (e.g., "NormMSE", "DeltaCE", "KLDiv")')
@@ -76,6 +75,7 @@ class Config:
             setattr(self, key, value)
 
 def load_config(config_path: str) -> Config:
+    # load config from yaml file
     with open(config_path, 'r') as file:
         config_dict = yaml.safe_load(file)
     return Config(config_dict)
@@ -125,7 +125,7 @@ class OpenWebTextDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
-
+    
 
 def create_dataloader(
     folder_path: str, 
@@ -187,6 +187,11 @@ def get_outputs(
         outputs = language_model(input_ids=input_ids, attention_mask=attention_mask)
     if cfg.model in ['Vanilla', 'Gated', 'TopK', 'JumpReLU']:
         hidden_states = outputs.hidden_states[cfg.layer]
+    elif cfg.model == 'MLSAE':
+        hidden_states = outputs.hidden_states[3:12]
+    elif cfg.model == 'Random':
+        cfg.random_layer = random.randint(1, 16)
+        hidden_states = outputs.hidden_states[cfg.random_layer]
     else:
         start_layer = cfg.n_layers // 4
         end_layer = cfg.n_layers * 3 // 4 + 1
@@ -525,6 +530,7 @@ class LinearWarmupLR(LambdaLR):
             decay_steps = self.num_training_steps - self.num_warmup_steps - self.num_training_steps // 5
             return max(0.0, float(self.num_training_steps - step - self.num_warmup_steps) / float(decay_steps))
 
+
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -563,9 +569,17 @@ class Trainer:
         elif cfg.model == 'Crosscoder':
             self.model = Crosscoder(cfg.hidden_size, cfg.n_layers, cfg.latent_size)
             self.title = f'Cross_CL{cfg.lamda}_{self.title}'
+        
+        elif cfg.model == 'MLSAE':
+            self.model = TopK(cfg.hidden_size, cfg.latent_size, cfg.k)
+            self.title = f'ML_K{cfg.k}_{self.title}'
+        
+        elif cfg.model == 'Random':
+            self.model = TopK(cfg.hidden_size, cfg.latent_size, cfg.k)
+            self.title = f'RDM_K{cfg.k}_{self.title}'
 
         else:
-            raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE, Crosscoder]')
+            raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE, Crosscoder, MLSAE, Random]')
         
         self.model.to(self.device)
         self.model.train()
@@ -574,46 +588,61 @@ class Trainer:
         num_training_steps = cfg.num_epochs * len(self.dataloader)
         num_warmup_steps = int(num_training_steps * 0.05)
         self.scheduler = LinearWarmupLR(self.optimizer, num_warmup_steps, num_training_steps, cfg.lr)
-
+    
     def run(self):
         if self.cfg.use_wandb:
             wandb_init(self.cfg.wandb_project, self.config_dict, self.title)
         curr_loss = 0.0
         unit_norm_decoder(self.model)
-        total_steps = 0
         for epoch in range(self.cfg.num_epochs):
             for batch_idx, batch in enumerate(self.dataloader):
                 _, _, _, hidden_states = get_outputs(self.cfg, batch, self.language_model, self.device)
-                x, _, _ = pre_process(hidden_states)
+                if self.cfg.model == 'MLSAE':
+                    for hidden_state in hidden_states:
+                        x, _, _ = pre_process(hidden_state)
+                        _, x_hat = self.model(x)
+                        mse_loss = Normalized_MSE_loss(x, x_hat)
+                        loss = mse_loss
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
+                        curr_loss = mse_loss.item()
 
-                if self.cfg.model == 'RouteSAE':
-                    batch_layer_weights, x, _, x_hat, _ = self.model(x, self.cfg.aggre, self.cfg.routing)
-                    self.layer_weights[:] += batch_layer_weights.sum(dim=(0, 1)).detach().cpu().numpy()
-                else:
-                    latents, x_hat = self.model(x)
-                
-                mse_loss = Normalized_MSE_loss(x, x_hat)
-
-                if self.cfg.model in ['Vanilla', 'Gated', 'Crosscoder']:
-                    l1_loss = L1_loss(latents)
-                    loss = mse_loss + self.cfg.lamda * l1_loss
-                
-                elif self.cfg.model == 'JumpReLU':
-                    l0_loss = Step_func.apply(latents, self.model.threshold, self.model.bandwidth).sum(dim=-1).mean()
-                    # l0_loss = Step_func.apply(pre_acts, self.model.threshold, self.model.bandwidth).sum(dim=-1).mean()
-                    loss = mse_loss + self.cfg.lamda * l0_loss
-                else:
-                    loss = mse_loss
-                
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-                self.scheduler.step()
-                curr_loss = mse_loss.item()
-
-                if batch_idx % self.cfg.steps == 0:
+                    self.scheduler.step()
                     unit_norm_decoder(self.model)
+
+                else:
+                    x, _, _ = pre_process(hidden_states)
+
+                    if self.cfg.model == 'RouteSAE':
+                        batch_layer_weights, x, _, x_hat, _ = self.model(x, self.cfg.aggre, self.cfg.routing)
+                        self.layer_weights[:] += batch_layer_weights.sum(dim=(0, 1)).detach().cpu().numpy()
+                    else:
+                        latents, x_hat = self.model(x)
+                    
+                    mse_loss = Normalized_MSE_loss(x, x_hat)
+
+                    if self.cfg.model in ['Vanilla', 'Gated', 'Crosscoder']:
+                        l1_loss = L1_loss(latents)
+                        loss = mse_loss + self.cfg.lamda * l1_loss
+                    
+                    elif self.cfg.model == 'JumpReLU':
+                        l0_loss = Step_func.apply(latents, self.model.threshold, self.model.bandwidth).sum(dim=-1).mean()
+                        # l0_loss = Step_func.apply(pre_acts, self.model.threshold, self.model.bandwidth).sum(dim=-1).mean()
+                        loss = mse_loss + self.cfg.lamda * l0_loss
+                    else:
+                        loss = mse_loss
+                    
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+
+                    self.scheduler.step()
+                    curr_loss = mse_loss.item()
+
+                    if batch_idx % self.cfg.steps == 0:
+                        unit_norm_decoder(self.model)
+                
                 if self.cfg.use_wandb:
                     wandb.log({'Normalized_MSE': curr_loss})
                     if self.cfg.model in ['Vanilla', 'Gated', 'JumpReLU', 'Crosscoder']:
@@ -621,6 +650,7 @@ class Trainer:
                         wandb.log({'Counts': counts})
                 else:
                     print(f'Epoch: {epoch+1}, Batch: {batch_idx+1}, Loss: {curr_loss}')
+                
         if self.cfg.use_wandb:
             if self.cfg.model == 'RouteSAE':
                 log_layers(self.layer_weights)
@@ -661,15 +691,22 @@ class Evaluater:
         elif cfg.model == 'Crosscoder':
             self.model = Crosscoder(cfg.hidden_size, cfg.n_layers, cfg.latent_size)
         
+        elif cfg.model == 'MLSAE':
+            self.model = TopK(cfg.hidden_size, cfg.latent_size, cfg.k)
+
+        elif cfg.model == 'Random':
+            self.model = TopK(cfg.hidden_size, cfg.latent_size, cfg.k)
+            self.cfg.random_layer = random.randint(4, 12)
+        
         else:
-            raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE, Crosscoder]')
+            raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE, Crosscoder, MLSAE, Random]')
         
         self.model.load_state_dict(torch.load(cfg.SAE_path, weights_only=True, map_location=self.device))
         self.model.to(self.device)
         self.model.eval()
 
         if cfg.model in ['Vanilla', 'Gated', 'TopK', 'JumpReLU'] and cfg.metric != 'NormMSE':
-            self.hooked_module = self.language_model.get_submodule(f'model.layers.{cfg.layer-1}')
+            self.hooked_module = self.language_model.get_submodule(f'model.layers.{cfg.layer-1}')           
         
         self.num_batches = 0
         self.total_loss = 0.0
@@ -726,68 +763,107 @@ class Evaluater:
     def run(self):
         if self.cfg.use_wandb:
             wandb_init(self.cfg.wandb_project, self.config_dict, self.title)
-        for batch_idx, batch in enumerate(self.dataloader):
-            input_ids, attention_mask, outputs, hidden_states = get_outputs(self.cfg, batch, self.language_model, self.device)
-            x, _, _ = pre_process(hidden_states)
 
-            if self.cfg.model == 'RouteSAE':
-                batch_layer_weights, x, latents, x_hat, _ = self.model(
-                    x, self.cfg.aggre, self.cfg.routing, self.cfg.infer_k, self.cfg.theta
-                )
-                self.layer_weights[:] += batch_layer_weights.sum(dim=(0, 1)).detach().cpu().numpy()
-
-            else:
-                latents, x_hat = self.model(x, self.cfg.infer_k, self.cfg.theta)
-                batch_layer_weights = None
-            
-            if self.cfg.metric == 'NormMSE': 
-                loss = Normalized_MSE_loss(x, x_hat)
-            
-            else:
-                assert self.cfg.model in ['Vanilla', 'Gated', 'TopK', 'JumpReLU', 'RouteSAE'], \
-                    'Downstream tasks only supported for Vanilla, TopK, JumpReLU, RouteSAE models'
+        if self.cfg.model == 'MLSAE':
+            loss_vector = torch.zeros(9, device=self.device)
+            for batch_idx, batch in enumerate(self.dataloader):
+                input_ids, attention_mask, outputs, hidden_states = get_outputs(self.cfg, batch, self.language_model, self.device)
                 logits_original = outputs.logits
-                if self.cfg.model == 'RouteSAE':
-                    assert self.cfg.routing != 'soft', 'RouteSAE with soft routing is not supported on downstream tasks'
-                    handles = hook_RouteSAE(self.cfg, self.model, self.language_model, batch_layer_weights)
-                else:
-                    handles = hook_SAE(self.cfg, self.model, self.hooked_module)
-                
-                logits_reconstruct = self.language_model(input_ids=input_ids, attention_mask=attention_mask).logits
-                for handle in handles:
-                    handle.remove()
-                
-                if self.cfg.metric == 'DeltaCE':
-                    del input_ids, attention_mask
-                    torch.cuda.empty_cache()
-                    loss = self.DeltaCE(logits_original, logits_reconstruct, input_ids)
+                for layer_idx, hidden_state in enumerate(hidden_states):
+                    x, _, _ = pre_process(hidden_state)
+                    latents, x_hat = self.model(x, self.cfg.infer_k, self.cfg.theta)
+                    batch_layer_weights = None
 
-                elif self.cfg.metric == 'Recovered':
-                    if self.cfg.model == 'RouteSAE':
-                        handles = hook_RouteSAE(self.cfg, self.model, self.language_model, batch_layer_weights, is_zero=True)
+                    if self.cfg.metric == 'NormMSE':
+                        loss = Normalized_MSE_loss(x, x_hat)
                     else:
-                        handles = hook_SAE(self.cfg, self.model, self.hooked_module, is_zero=True)
-                    logits_zero = self.language_model(input_ids=input_ids, attention_mask=attention_mask).logits
+                        self.hooked_module = self.language_model.get_submodule(f'model.layers.{layer_idx}')
+                        handles = hook_SAE(self.cfg, self.model, self.hooked_module)
+
+                        logits_reconstruct = self.language_model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+                        for handle in handles:
+                            handle.remove()
+
+                        if self.cfg.metric == 'KLDiv':
+                            torch.cuda.empty_cache()
+                            loss = self.KLDiv(logits_original, logits_reconstruct)
+                    
+                    wandb.log({'Batch_loss': loss.item()})
+                    loss_vector[layer_idx] += loss.item()
+                self.num_batches += 1
+            
+            loss_vector /= self.num_batches
+            wandb.log({'Avg_loss': loss_vector.mean().item()})
+            wandb.finish()
+            return loss_vector.mean().item()
+        
+        else:
+            for batch_idx, batch in enumerate(self.dataloader):
+                input_ids, attention_mask, outputs, hidden_states = get_outputs(self.cfg, batch, self.language_model, self.device)                   
+                x, _, _ = pre_process(hidden_states)
+
+                if self.cfg.model == 'RouteSAE':
+                    batch_layer_weights, x, latents, x_hat, _ = self.model(
+                        x, self.cfg.aggre, self.cfg.routing, self.cfg.infer_k, self.cfg.theta
+                    )
+                    self.layer_weights[:] += batch_layer_weights.sum(dim=(0, 1)).detach().cpu().numpy()
+
+                else:
+                    latents, x_hat = self.model(x, self.cfg.infer_k, self.cfg.theta)
+                    batch_layer_weights = None
+                
+                if self.cfg.metric == 'NormMSE': 
+                    loss = Normalized_MSE_loss(x, x_hat)
+                
+                else:
+                    assert self.cfg.model in ['Vanilla', 'Gated', 'TopK', 'JumpReLU', 'RouteSAE', 'Random'], \
+                        'Downstream tasks only supported for Vanilla, TopK, JumpReLU, RouteSAE models'
+                    logits_original = outputs.logits
+                    if self.cfg.model == 'RouteSAE':
+                        assert self.cfg.routing != 'soft', 'RouteSAE with soft routing is not supported on downstream tasks'
+                        handles = hook_RouteSAE(self.cfg, self.model, self.language_model, batch_layer_weights)
+                    elif self.cfg.model == 'Random':
+                        self.hooked_module = self.language_model.get_submodule(f'model.layers.{self.cfg.random_layer-1}')
+                        handles = hook_SAE(self.cfg, self.model, self.hooked_module)
+                    else:
+                        handles = hook_SAE(self.cfg, self.model, self.hooked_module)
+                    
+                    logits_reconstruct = self.language_model(input_ids=input_ids, attention_mask=attention_mask).logits
                     for handle in handles:
                         handle.remove()
-                    loss = self.Recovered(logits_original, logits_reconstruct, logits_zero, input_ids)
-                
-                elif self.cfg.metric == 'KLDiv':
-                    del input_ids, attention_mask
-                    torch.cuda.empty_cache()
-                    loss = self.KLDiv(logits_original, logits_reconstruct)
+                    
+                    if self.cfg.metric == 'DeltaCE':
+                        del input_ids, attention_mask
+                        torch.cuda.empty_cache()
+                        loss = self.DeltaCE(logits_original, logits_reconstruct, input_ids)
 
-            self.num_batches += 1
-            self.total_loss += loss.item()
+                    elif self.cfg.metric == 'Recovered':
+                        if self.cfg.model == 'RouteSAE':
+                            handles = hook_RouteSAE(self.cfg, self.model, self.language_model, batch_layer_weights, is_zero=True)
+                        else:
+                            handles = hook_SAE(self.cfg, self.model, self.hooked_module, is_zero=True)
+                        logits_zero = self.language_model(input_ids=input_ids, attention_mask=attention_mask).logits
+                        for handle in handles:
+                            handle.remove()
+                        loss = self.Recovered(logits_original, logits_reconstruct, logits_zero, input_ids)
+                    
+                    elif self.cfg.metric == 'KLDiv':
+                        del input_ids, attention_mask
+                        torch.cuda.empty_cache()
+                        loss = self.KLDiv(logits_original, logits_reconstruct)
 
-            if self.cfg.use_wandb:
-                wandb.log({'Batch_loss': loss.item()})
-                if self.cfg.model in ['Vanilla', 'Gated', 'JumpReLU', 'Crosscoder'] or self.cfg.theta is not None:
-                    counts = (latents != 0).sum(dim=-1).float().mean().item()
-                    self.total_counts += counts
-                    wandb.log({'Counts': counts})
-            else:
-                print(f'Batch: {batch_idx+1}, Loss: {loss.item()}')
+                self.num_batches += 1
+                self.total_loss += loss.item()
+
+                if self.cfg.use_wandb:
+                    wandb.log({'Batch_loss': loss.item()})
+                    if self.cfg.model in ['Vanilla', 'Gated', 'JumpReLU', 'Crosscoder'] or self.cfg.theta is not None:
+                        counts = (latents != 0).sum(dim=-1).float().mean().item()
+                        self.total_counts += counts
+                        wandb.log({'Counts': counts})
+                else:
+                    print(f'Batch: {batch_idx+1}, Loss: {loss.item()}')
         
         if self.cfg.use_wandb:
             wandb.log({'Avg_loss': self.total_loss / self.num_batches})
@@ -822,6 +898,12 @@ class Applier:
         elif cfg.model == 'Crosscoder':
             self.model = Crosscoder(cfg.hidden_size, cfg.n_layers, cfg.latent_size)
         
+        elif cfg.model == 'MLSAE':
+            self.model = TopK(cfg.hidden_size, cfg.latent_size, cfg.k)
+        
+        elif cfg.model == 'Random':
+            self.model = TopK(cfg.hidden_size, cfg.latent_size, cfg.k)
+        
         else:
             raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE, Crosscoder]')
         
@@ -848,7 +930,6 @@ class Applier:
         lines: int = 4,  
         output_path=None
     ):
-
         if output_path is None:
             output_path = f'../contexts/{os.path.splitext(os.path.basename(self.cfg.SAE_path))[0]}_{threshold}.json'
 
@@ -923,6 +1004,8 @@ class Applier:
 
         for batch_idx, batch in enumerate(dataloader):
             input_ids, _, _, hidden_states = get_outputs(self.cfg, batch, self.language_model, self.device)
+            if self.cfg.model == 'MLSAE':
+                hidden_states = hidden_states[-1]
             x, _, _ = pre_process(hidden_states)
             
             if self.cfg.model == 'RouteSAE':
@@ -1213,12 +1296,6 @@ class Interpreter:
         high_level_features = 0
         abstract_total_score = 0.0
 
-        # pattern = re.compile(
-        #     r"Explanation:\s*(?P<explanation>.+?)\s*Feature category:\s*(?P<category>Low-level|High-level|Undiscernible)\s*\n"
-        #     r"Score:\s*(?P<score>[1-5])\s*\n",
-        #     re.IGNORECASE | re.DOTALL,
-        # )
-
         pattern = re.compile(
             r"Feature category:\s*(?P<category>low-level|high-level|undiscernible)\s*\n"
             r"Score:\s*(?P<score>[1-5])\s*\n"
@@ -1322,7 +1399,7 @@ class Interpreter:
 class SAE_pipeline:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.title = f'{cfg.language_model}_{cfg.pipe_data_path[0].split('/')[-1]}_{cfg.latent_size}'
+        self.title = f'{cfg.language_model}_{cfg.pipe_data_path[0].split("/")[-1]}_{cfg.latent_size}'
 
         if cfg.model == 'Vanilla':
             self.title = f'L{cfg.layer}_VL{cfg.lamda}_{self.title}'
@@ -1338,8 +1415,14 @@ class SAE_pipeline:
 
         elif cfg.model == 'RouteSAE':
             self.title = f'{cfg.aggre}_{cfg.routing}_K{cfg.k}_{self.title}'
+        
+        elif cfg.model == 'MLSAE':
+            self.title = f'ML_K{cfg.k}_{self.title}'
+        
+        elif cfg.model == 'Random':
+            self.title = f'RDM_K{cfg.k}_{self.title}'
         else:
-            raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE]')
+            raise ValueError(f'Invalid model name: {cfg.model} Expected one of [Vanilla, Gated, TopK, JumpReLU, RouteSAE, MLSAE, Random]')
         
         self.cfg.SAE_path = f'../SAE_models/{self.title}.pt'
         self.result_dict = {}
