@@ -1,6 +1,9 @@
-# RouteSAE
+# Route Sparse Autoencoder to Interpret Large Language Models (RouteSAE)
+
+🎉 **This work has been accepted for Oral presentation at EMNLP 2025.**
+
 ## Introduction
-This repository contains the implementation of RouteSAE.
+This repository contains the official implementation of RouteSAE.
 
 You can download the required dataset and models from the following links:
 
