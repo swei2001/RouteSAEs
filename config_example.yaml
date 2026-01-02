@@ -1,0 +1,67 @@
+# Example Configuration File for RouteSAE Training
+# Copy this file and modify according to your setup
+
+# Model Configuration
+model: RouteSAE                    # Options: Vanilla, Gated, TopK, JumpReLU, RouteSAE, Crosscoder
+language_model: 1B                 # Language model identifier
+model_path: /path/to/Llama-3.2-1B-Instruct  # Path to pre-trained language model
+
+# Architecture Parameters
+hidden_size: 2048                  # LLM hidden dimension
+latent_size: 16384                 # SAE latent dimension
+n_layers: 16                       # Number of LLM layers (for RouteSAE, Crosscoder)
+layer: 12                          # Target layer (for single-layer SAEs)
+
+# Sparsity Parameters
+k: 64                              # Number of active features (TopK, RouteSAE)
+lamda: 0.01                        # L1 regularization weight (Vanilla, Gated, JumpReLU, Crosscoder)
+
+# Routing Parameters (RouteSAE only)
+aggre: sum                         # Aggregation method: sum, mean
+routing: hard                      # Routing strategy: hard, soft
+
+# Training Parameters
+batch_size: 64                     # Training batch size
+max_length: 512                    # Maximum sequence length
+num_epochs: 1                      # Number of training epochs
+lr: 0.0005                         # Learning rate
+betas: [0.9, 0.999]               # Adam optimizer betas
+seed: 42                           # Random seed for reproducibility
+steps: 10                          # Steps between decoder normalization
+
+# Data Paths
+data_path: /path/to/train_data     # Training data path
+# For pipeline mode:
+# pipe_data_path: 
+#   - /path/to/train_data
+#   - /path/to/eval_data
+#   - /path/to/apply_data
+
+# Device Configuration
+device: cuda:0                     # Device: cuda:0, cuda:1, cpu
+
+# Experiment Tracking
+use_wandb: 1                       # Enable (1) or disable (0) wandb logging
+wandb_project: my_sae_project      # Wandb project name
+# For pipeline mode:
+# pipe_project:
+#   - train_project
+#   - eval_project
+#   - pipe_project
+
+# Evaluation Parameters
+SAE_path: ../SAE_models/model.pt   # Path to trained SAE model
+metric: NormMSE                    # Evaluation metric: NormMSE, KLDiv, DeltaCE, Recovered
+infer_k: 64                        # Number of active features during inference (optional)
+theta: null                        # Activation threshold during inference (optional)
+
+# Feature Interpretation (GPT-4 API)
+api_base: https://your-api-endpoint.openai.azure.com/
+api_key: your_api_key_here
+api_version: 2024-02-01
+engine: gpt-4o                     # GPT model: gpt-4o, gpt-4o-mini
+
+# Application Parameters
+threshold: 15.0                    # Feature activation threshold
+max_per_token: 2                   # Max contexts per token type
+lines: 4                           # Minimum lines for feature inclusion

@@ -1,10 +1,102 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Model checkpoints and outputs
+SAE_models/*
 contexts/*
 interpret/*
-SAE_models/*
+clamp/*
+
+# But keep the directories with a placeholder
+!SAE_models/.gitkeep
+!contexts/.gitkeep
+!interpret/.gitkeep
+!clamp/.gitkeep
+
+# Keep example files
+!*_example.yaml
+!*_example.json
+!*_example.sh
+
+# Data files
+*.jsonl
+*.csv
+*.tsv
+
+# Weights & Biases
 wandb/
 
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Environment variables
+.env
+.env.local
+
+# API keys and secrets (IMPORTANT!)
+*api_key*
+*API_KEY*
+*secret*
+*SECRET*
+
+# User-specific config files (keep examples only)
 *.yaml
+!config_example.yaml
+
+# Shell scripts (keep examples only)
 *.sh
-*.ipynb
-*.json
+!run_example.sh

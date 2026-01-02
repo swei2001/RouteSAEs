@@ -1,0 +1,8 @@
+# This directory stores trained SAE model checkpoints
+# Models are saved as .pt files with naming convention:
+# [model_type]_[params]_[language_model]_[dataset]_[latent_size].pt
+
+# Example:
+# - L12_K64_1B_100M_16384.pt (TopK SAE, layer 12, k=64)
+# - sum_hard_K64_1B_100M_16384.pt (RouteSAE with sum aggregation and hard routing)
+# - Cross_CL0.01_1B_100M_16384.pt (Crosscoder with lambda=0.01)
